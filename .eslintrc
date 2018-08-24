@@ -1,0 +1,17 @@
+{
+    // eslint: recommended automatically enables most/all rules from the
+    // possible errors section and more:
+    // http://eslint.org/docs/rules/#possible-errors
+    "extends": "eslint:recommended",
+    "plugins": [
+      "@lrowe/flow-remove-types"
+    ],
+    "env": {
+        "browser": false,
+        "node": true,
+        "es6": true
+    },
+    "parserOptions": {
+        "ecmaVersion": 2018
+    }
+}

@@ -1,0 +1,37 @@
+{
+  "name": "experimental-falcor-persistent-cache",
+  "version": "1.0.0",
+  "description": "",
+  "main": "./lib/index.js",
+  "scripts": {
+    "flow": "flow",
+    "flow-coverage": "flow-coverage-report",
+    "lint": "eslint src/ test/ flow-typed/custom/ codemod/**.js",
+    "prepare": "test -e lib && rm -r lib; flow-remove-types --out-dir lib/ src/ && (cd src/; find * -type f -name '*.js' -exec cp {} ../lib/{}.flow \\;)",
+    "prettier": "prettier --write src/**.js test/**.js flow-typed/custom/**.js codemod/**.js",
+    "check-formatting": "prettier --list-different src/**.js test/**.js flow-typed/custom/**.js codemod/**.js",
+    "test": "FALCOR_OBSERVABLE_NO_CATCH=true mocha -r flow-remove-types/register",
+    "release": "standard-version"
+  },
+  "author": "Laurence Rowe",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "falcor-observable": "^1.3.0",
+    "falcor-path-utils": "^0.7.0",
+    "node-lmdb": "^0.6.0"
+  },
+  "devDependencies": {
+    "@lrowe/eslint-plugin-flow-remove-types": "0.0.1",
+    "chai": "^4.1.2",
+    "eslint": "^5.4.0",
+    "falcor-json-graph": "^2.2.2",
+    "flow-bin": "^0.79.1",
+    "flow-coverage-report": "^0.5.0",
+    "flow-remove-types": "^1.2.3",
+    "mocha": "^5.2.0",
+    "prettier": "^1.14.2",
+    "sinon": "^6.1.5",
+    "standard-version": "^4.4.0",
+    "tmp": "0.0.33"
+  }
+}
