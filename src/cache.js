@@ -26,37 +26,41 @@ const EMPTY_BUFFER = Buffer.alloc(0);
 const SEP = " "; // all lower chars are escaped.
 
 function encodeKey(key: Key): EncodedKey {
-  return encodeURIComponent(String(key)) + SEP;
+  return encodeURIComponent(String(key));
 }
 
 function decodeKey(encoded: EncodedKey): Key {
-  return decodeURIComponent(encoded.slice(0, -1));
+  return decodeURIComponent(encoded);
 }
 
 function encodeKeys(path: Path): EncodedKey[] {
   return path.map(key => encodeKey(key));
 }
 
-function encodePath(path: Path): EncodedPath {
-  return encodeKeys(path).join("");
+function joinEncodedKeys(encodedKeys: EncodedKey[]): EncodedPath {
+  return encodedKeys.join(SEP) + SEP;
 }
 
 function splitEncodedPath(encoded: EncodedPath): EncodedKey[] {
   const out = [];
   let sliceStart = 0;
   let sliceEnd;
-  while ((sliceEnd = encoded.indexOf(SEP, sliceStart) + 1) !== 0) {
+  while ((sliceEnd = encoded.indexOf(SEP, sliceStart)) !== -1) {
     out.push(encoded.slice(sliceStart, sliceEnd));
-    sliceStart = sliceEnd;
+    sliceStart = sliceEnd + 1;
   }
   return out;
+}
+
+function encodePath(path: Path): EncodedPath {
+  return joinEncodedKeys(encodeKeys(path));
 }
 
 function decodePath(encoded: EncodedPath): Path {
   return encoded
     .slice(0, -1)
     .split(SEP)
-    .map(e => decodeURIComponent(e));
+    .map(e => decodeKey(e));
 }
 
 function encodePathTree(pathSet: PathSet): EncodedPathTree | null {
@@ -358,7 +362,7 @@ function _walkCache(
   let cursor = treeCursor(encodedPathTree);
   while (cursor !== null) {
     const encodedKeys = encodedKeysFromTreeCursor(cursor);
-    const encodedPath = encodedKeys.join("");
+    const encodedPath = joinEncodedKeys(encodedKeys);
 
     if (typeof found[encodedPath] !== "undefined") {
       cursor = nextTreeCursor(cursor);
