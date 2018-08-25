@@ -13,7 +13,8 @@ import type {
   IDataSource
 } from "falcor-json-graph";
 export type EncodedKey = string;
-export type EncodedPath = string;
+export type EncodedPath = Buffer;
+export type EncodedLeaf = Buffer;
 export type EncodedPathTreeEntry = [EncodedKey, EncodedPathTree | null];
 export type EncodedPathTree = EncodedPathTreeEntry[];
 
@@ -22,8 +23,8 @@ const { mergeJsonGraphEnvelope, mergeJsonGraph } = require("falcor-json-graph");
 const { iterKeySet, iterJsonGraph } = require("./iter");
 const lmdb = require("node-lmdb");
 
-const EMPTY_BUFFER = Buffer.alloc(0);
 const SEP = " "; // all lower chars are escaped.
+const SEP_BUFFER = Buffer.from(SEP);
 
 function encodeKey(key: Key): EncodedKey {
   return encodeURIComponent(String(key));
@@ -37,16 +38,20 @@ function encodeKeys(path: Path): EncodedKey[] {
   return path.map(key => encodeKey(key));
 }
 
+function decodeKeys(encodedKeys: EncodedKey[]): Path {
+  return encodedKeys.map(encoded => decodeKey(encoded));
+}
+
 function joinEncodedKeys(encodedKeys: EncodedKey[]): EncodedPath {
-  return encodedKeys.join(SEP) + SEP;
+  return Buffer.from(encodedKeys.join(SEP) + SEP);
 }
 
 function splitEncodedPath(encoded: EncodedPath): EncodedKey[] {
   const out = [];
   let sliceStart = 0;
   let sliceEnd;
-  while ((sliceEnd = encoded.indexOf(SEP, sliceStart)) !== -1) {
-    out.push(encoded.slice(sliceStart, sliceEnd));
+  while ((sliceEnd = encoded.indexOf(SEP_BUFFER, sliceStart)) !== -1) {
+    out.push(encoded.slice(sliceStart, sliceEnd).toString());
     sliceStart = sliceEnd + 1;
   }
   return out;
@@ -57,10 +62,15 @@ function encodePath(path: Path): EncodedPath {
 }
 
 function decodePath(encoded: EncodedPath): Path {
-  return encoded
-    .slice(0, -1)
-    .split(SEP)
-    .map(e => decodeKey(e));
+  return decodeKeys(splitEncodedPath(encoded));
+}
+
+function encodeLeaf(value: JsonGraphLeaf): EncodedLeaf {
+  return Buffer.from(JSON.stringify(value));
+}
+
+function decodeLeaf(encoded: EncodedLeaf): JsonGraphLeaf {
+  return JSON.parse(encoded.toString());
 }
 
 /* Return EncodedPathTree for pathSets.
@@ -361,7 +371,7 @@ function isBranch(node: JsonGraphNode): boolean %checks {
 
 function walkCache(
   pathSets: PathSet[],
-  getClosestEntry: (encodedPath: EncodedPath) => [EncodedPath, JsonGraphLeaf]
+  getClosestEntry: (encodedPath: EncodedPath) => ?[EncodedPath, EncodedLeaf]
 ): {
   found: JsonGraph,
   missing: EncodedPathTree | null
@@ -385,7 +395,7 @@ function _walkCache(
   encodedPathTree: EncodedPathTree,
   foundIn: JsonGraph,
   missingIn: EncodedPathTree | null,
-  getClosestEntry: (encodedPath: EncodedPath) => [EncodedPath, JsonGraphLeaf]
+  getClosestEntry: (encodedPath: EncodedPath) => ?[EncodedPath, EncodedLeaf]
 ): {
   remaining: EncodedPathTree | null,
   missing: EncodedPathTree | null,
@@ -394,12 +404,16 @@ function _walkCache(
   let found = foundIn;
   let remaining = null;
   let missing = missingIn;
-  let cursor = treeCursor(encodedPathTree);
+  const rootCursor = treeCursor(encodedPathTree);
+  if (rootCursor === null) {
+    return { remaining, missing, found };
+  }
+  let cursor = rootCursor;
   while (cursor !== null) {
     const encodedKeys = encodedKeysFromTreeCursor(cursor);
 
     // First look in our already found jsonGraph
-    const cursorPath = encodedKeys.map(encoded => decodeKey(encoded));
+    const cursorPath = decodeKeys(encodedKeys);
     const foundPV = traverseJsonGraphOnce(found, cursorPath);
     if (foundPV) {
       const { path, value } = foundPV;
@@ -430,9 +444,19 @@ function _walkCache(
     }
 
     const encodedPath = joinEncodedKeys(encodedKeys);
-    const [foundPath, value] = getClosestEntry(encodedPath);
+    const foundEntry = getClosestEntry(encodedPath);
+    if (!foundEntry) {
+      const next = null;
+      const ancestor = rootCursor;
+      const skipped = betweenTreeCursors(ancestor, cursor, next);
+      missing = mergeEncodedPathTree(missing, skipped);
+      cursor = next;
+      continue;
+    }
+    const [foundPath, foundValue] = foundEntry;
+    const value = decodeLeaf(foundValue);
 
-    if (foundPath === encodedPath) {
+    if (foundPath.compare(encodedPath) === 0) {
       found = mergeJsonGraph(
         found,
         (jsonGraphFromEncodedEntry(foundPath, value): any)
@@ -573,30 +597,24 @@ class CacheDataSource implements IDataSource {
   _getClosestEntry(
     cursor: any,
     encodedPath: EncodedPath
-  ): [EncodedPath, JsonGraphLeaf] {
-    let k = (
-      cursor.goToRange(Buffer.from(encodedPath)) || EMPTY_BUFFER
-    ).toString();
-    if (k !== encodedPath) {
-      k = (cursor.goToPrev() || EMPTY_BUFFER).toString();
+  ): ?[EncodedPath, EncodedLeaf] {
+    let k = cursor.goToRange(encodedPath);
+    if (k !== null && k.compare(encodedPath) !== 0) {
+      k = cursor.goToPrev();
     }
-    if (k === "") {
-      return ["", null];
+    if (k === null) {
+      return null;
     }
     const v = cursor.getCurrentBinary();
-    return [k, JSON.parse(v.toString())];
+    return [k, v];
   }
 
   _setCache({ jsonGraph }: JsonGraphEnvelope): void {
     const txn = this.env.beginTxn();
     for (const { path, value } of iterJsonGraph(jsonGraph)) {
       const encodedPath = encodePath(path);
-      const encodedValue = JSON.stringify(value);
-      txn.putBinary(
-        this.dbi,
-        Buffer.from(encodedPath),
-        Buffer.from(encodedValue)
-      );
+      const encodedValue = encodeLeaf(value);
+      txn.putBinary(this.dbi, encodedPath, encodedValue);
     }
     txn.commit();
   }
@@ -624,7 +642,7 @@ class CacheDataSource implements IDataSource {
     const cursor = new lmdb.Cursor(txn, this.dbi);
     let found = cursor.goToFirst();
     while (found !== null) {
-      yield found.toString();
+      yield found;
       found = cursor.goToNext();
     }
     cursor.close();
