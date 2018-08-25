@@ -63,18 +63,30 @@ function decodePath(encoded: EncodedPath): Path {
     .map(e => decodeKey(e));
 }
 
-function encodePathTree(pathSet: PathSet): EncodedPathTree | null {
-  return pathSet.reduceRight(
-    (right, keySet) =>
-      Array.from(iterKeySet(keySet))
-        .map(key => encodeKey(key))
-        .sort()
-        .reverse()
-        .map(encodedKey => [encodedKey, right]),
-    null
-  );
+/* Return EncodedPathTree for pathSets.
+ * Supply subtree when optimizing an existing EncodedPathTree.
+ */
+function encodePathTree(
+  pathSets: PathSet[],
+  subtree: EncodedPathTree | null = null
+): EncodedPathTree | null {
+  return pathSets
+    .map(pathSet =>
+      pathSet.reduceRight(
+        (right, keySet) =>
+          Array.from(iterKeySet(keySet))
+            .map(key => encodeKey(key))
+            .sort()
+            .reverse()
+            .map(encodedKey => [encodedKey, right]),
+        subtree
+      )
+    )
+    .reduce((acc, cur) => mergeEncodedPathTree(acc, cur), null);
 }
 
+/* Immutably merge EncodedPathTrees maintaining sorted order (highest first).
+ */
 function mergeEncodedPathTree(
   left: EncodedPathTree | null,
   right: EncodedPathTree | null
@@ -88,7 +100,6 @@ function mergeEncodedPathTree(
   if (left === right) {
     return left;
   }
-  // Merge maintaining sorted order (highest first).
   const merged = [];
   let leftIndex = 0;
   let rightIndex = 0;
@@ -161,7 +172,7 @@ function firstTreeCursor(current: TreeCursor): TreeCursor | null {
 }
 
 /* Get a cursor to the first leaf node after current
-*/
+ */
 function nextTreeCursor(current: TreeCursor): TreeCursor | null {
   const [tree, index, parent] = current;
   return firstTreeCursor([tree, index + 1, parent]);
@@ -183,19 +194,22 @@ ancestor = tree([])
 
 */
 
-/* Seek to the first tree leaf path less than or equal to foundKeys.
+/* Return the closest ancestor cursor of current along the path foundKeys.
  */
-function seekTreeCursor(
+function closestCommonAncestorTreeCursor(
   current: TreeCursor,
+  currentKeys: EncodedKey[],
   foundKeys: EncodedKey[]
 ): {
-  next: TreeCursor | null,
-  ancestor: TreeCursor
+  ancestor: TreeCursor,
+  remainingPath: ?(EncodedKey[])
 } {
-  const currentKeys = encodedKeysFromTreeCursor(current);
   const fdi = firstDifferentIndex(foundKeys, currentKeys);
   let cursor = current;
-  let i = currentKeys.length - fdi;
+  let i =
+    fdi === -1
+      ? currentKeys.length - foundKeys.length
+      : currentKeys.length - fdi;
   while (i > 0) {
     const [, , parent] = cursor;
     if (parent === null) {
@@ -205,10 +219,12 @@ function seekTreeCursor(
     --i;
   }
   const ancestor = cursor;
-  const next = traverseTreeCursor(ancestor, foundKeys.slice(fdi));
-  return { next, ancestor };
+  const remainingPath = fdi === -1 ? null : foundKeys.slice(fdi);
+  return { ancestor, remainingPath };
 }
 
+/* Return the first leaf cursor beyond the relative path.
+ */
 function traverseTreeCursor(
   current: TreeCursor,
   path: EncodedKey[]
@@ -237,41 +253,48 @@ function traverseTreeCursor(
   return firstTreeCursor([tree, i, parent]);
 }
 
-function trimUpperInclusive(
+/* Return the EncodedPathTree without the section above indicesPath
+ * (including the indicesPath bound itself.)
+ */
+function belowUpperBoundInclusive(
   branch: EncodedPathTree,
-  indices: number[]
+  indicesPath: number[]
 ): EncodedPathTree {
-  if (indices.length === 0) {
+  if (indicesPath.length === 0) {
     throw new Error("unreachable");
   }
-  const [index, ...remaining] = indices;
+  const [index, ...remaining] = indicesPath;
   const [key, child] = branch[index];
   if (child === null) {
     return branch.slice(index);
   }
-  const newChild = trimUpperInclusive(child, remaining);
+  const newChild = belowUpperBoundInclusive(child, remaining);
   return [[key, newChild], ...branch.slice(index + 1)];
 }
 
-function trimLowerExclusive(
+/* Return the EncodedPathTree without the section below indicesPath
+ * (excluding the indicesPath bound itself.)
+ */
+function aboveLowerBoundExclusive(
   branch: EncodedPathTree,
-  indices: number[]
+  indicesPath: number[]
 ): EncodedPathTree | null {
-  if (indices.length === 0) {
+  if (indicesPath.length === 0) {
     throw new Error("unreachable");
   }
-  const [index, ...remaining] = indices;
+  const [index, ...remaining] = indicesPath;
   const [key, child] = branch[index];
   if (child === null) {
     return branch.slice(0, index);
   }
-  const newChild = trimUpperInclusive(child, remaining);
+  const newChild = aboveLowerBoundExclusive(child, remaining);
   return [...branch.slice(0, index), [key, newChild]];
 }
 
-// inclusive upper bound
-// exclusive lower bound
-function betweenCursors(
+/* Return the EncodedPathTree between the current cursor (inclusive) and the
+ * next cursor (exclusive).
+ */
+function betweenTreeCursors(
   ancestor: TreeCursor,
   current: TreeCursor,
   next: TreeCursor | null
@@ -283,15 +306,17 @@ function betweenCursors(
   }
   if (next !== null) {
     const lowerIndices = indicesFromTreeCursor(next, ancestor);
-    commonRoot = trimLowerExclusive(commonRoot, lowerIndices);
+    commonRoot = aboveLowerBoundExclusive(commonRoot, lowerIndices);
   }
   if (commonRoot === null) {
     return null;
   }
   const upperIndices = indicesFromTreeCursor(current, ancestor);
-  return trimUpperInclusive(commonRoot, upperIndices);
+  return belowUpperBoundInclusive(commonRoot, upperIndices);
 }
 
+/* Return the encoded key path between ancestor and cursor.
+ */
 function encodedKeysFromTreeCursor(
   cursor: TreeCursor,
   ancestor: TreeCursor | null = null
@@ -305,6 +330,8 @@ function encodedKeysFromTreeCursor(
   return [...encodedKeysFromTreeCursor(parent, ancestor), key];
 }
 
+/* Return the indices path between ancestor and cursor.
+ */
 function indicesFromTreeCursor(
   cursor: TreeCursor,
   ancestor: TreeCursor | null = null
@@ -324,6 +351,14 @@ function firstDifferentIndex(
   return foundKeys.findIndex((k, i) => searchedKeys[i] !== k);
 }
 
+function isRef(node: JsonGraphNode): boolean %checks {
+  return typeof node === "object" && node !== null && node.$type === "ref";
+}
+
+function isBranch(node: JsonGraphNode): boolean %checks {
+  return typeof node === "object" && node !== null && node.$type === undefined;
+}
+
 function walkCache(
   pathSets: PathSet[],
   getClosestEntry: (encodedPath: EncodedPath) => [EncodedPath, JsonGraphLeaf]
@@ -331,14 +366,12 @@ function walkCache(
   found: JsonGraph,
   missing: EncodedPathTree | null
 } {
-  const encodedPathTree = pathSets
-    .map(pathSet => encodePathTree(pathSet))
-    .reduce((acc, cur) => mergeEncodedPathTree(acc, cur), null);
-  const found = {};
+  const encodedPathTree = encodePathTree(pathSets);
+  let found = {};
   let missing = null;
   let remaining = encodedPathTree;
   while (remaining !== null) {
-    ({ remaining, missing } = _walkCache(
+    ({ remaining, missing, found } = _walkCache(
       remaining,
       found,
       missing,
@@ -350,77 +383,99 @@ function walkCache(
 
 function _walkCache(
   encodedPathTree: EncodedPathTree,
-  found: { [encodedPath: EncodedPath]: JsonGraphLeaf },
+  foundIn: JsonGraph,
   missingIn: EncodedPathTree | null,
   getClosestEntry: (encodedPath: EncodedPath) => [EncodedPath, JsonGraphLeaf]
 ): {
   remaining: EncodedPathTree | null,
-  missing: EncodedPathTree | null
+  missing: EncodedPathTree | null,
+  found: JsonGraph
 } {
+  let found = foundIn;
   let remaining = null;
   let missing = missingIn;
   let cursor = treeCursor(encodedPathTree);
   while (cursor !== null) {
     const encodedKeys = encodedKeysFromTreeCursor(cursor);
-    const encodedPath = joinEncodedKeys(encodedKeys);
 
-    if (typeof found[encodedPath] !== "undefined") {
-      cursor = nextTreeCursor(cursor);
+    // First look in our already found jsonGraph
+    const cursorPath = encodedKeys.map(encoded => decodeKey(encoded));
+    const foundPV = traverseJsonGraphOnce(found, cursorPath);
+    if (foundPV) {
+      const { path, value } = foundPV;
+
+      if (cursorPath.length === path.length) {
+        cursor = nextTreeCursor(cursor);
+        continue;
+      }
+
+      const foundKeys = encodeKeys(path);
+      const { ancestor } = closestCommonAncestorTreeCursor(
+        cursor,
+        encodedKeys,
+        foundKeys
+      );
+
+      if (isRef(value)) {
+        // optimize path tree below ancestor onto the ref target.
+        const [tree, index] = ancestor;
+        const [, subtree] = tree[index];
+        const optimized = encodePathTree([(value.value: any)], subtree);
+        remaining = mergeEncodedPathTree(remaining, optimized);
+      }
+
+      // If value is not a ref we can simply skip over the ancestor's subtree.
+      cursor = nextTreeCursor(ancestor);
       continue;
     }
 
+    const encodedPath = joinEncodedKeys(encodedKeys);
     const [foundPath, value] = getClosestEntry(encodedPath);
 
     if (foundPath === encodedPath) {
-      found[foundPath] = value;
+      found = mergeJsonGraph(
+        found,
+        (jsonGraphFromEncodedEntry(foundPath, value): any)
+      );
       cursor = nextTreeCursor(cursor);
       continue;
     }
 
     const foundKeys = splitEncodedPath(foundPath);
-    const fdi = firstDifferentIndex(foundKeys, encodedKeys);
+    const { ancestor, remainingPath } = closestCommonAncestorTreeCursor(
+      cursor,
+      encodedKeys,
+      foundKeys
+    );
 
     // short-circuit
     // equivalent to encodedPath.startsWith(foundPath)
-    if (fdi === -1) {
-      found[foundPath] = value;
+    if (!remainingPath) {
+      found = mergeJsonGraph(
+        found,
+        (jsonGraphFromEncodedEntry(foundPath, value): any)
+      );
 
-      let cursorFound = cursor;
-      let i = encodedKeys.length - foundKeys.length;
-      while (i > 0 && cursorFound !== null) {
-        --i;
-        [, , cursorFound] = cursorFound;
-      }
-      if (cursorFound === null) {
-        throw new Error("unreachable");
-      }
-      const [tree, index] = cursorFound;
-
-      if (
-        typeof value === "object" &&
-        value !== null &&
-        value.$type === "ref"
-      ) {
-        // follow reference
-        const refPath = encodeKeys(value.value);
-        const [, seed] = tree[index];
-        const optimized = refPath.reduceRight((acc, cur) => {
-          return [[cur, acc]];
-        }, seed);
+      if (isRef(value)) {
+        // optimize path tree below ancestor onto the ref target.
+        const [tree, index] = ancestor;
+        const [, subtree] = tree[index];
+        const optimized = encodePathTree([(value.value: any)], subtree);
         remaining = mergeEncodedPathTree(remaining, optimized);
       }
 
-      cursor = nextTreeCursor(cursorFound);
+      // If value is not a ref we can simply skip over the ancestor's subtree.
+      cursor = nextTreeCursor(ancestor);
       continue;
     }
 
-    const { next, ancestor } = seekTreeCursor(cursor, foundKeys);
-    const skipped = betweenCursors(ancestor, cursor, next);
+    const next = traverseTreeCursor(ancestor, remainingPath);
+    const skipped = betweenTreeCursors(ancestor, cursor, next);
     missing = mergeEncodedPathTree(missing, skipped);
     cursor = next;
     continue;
   }
-  return { remaining, missing };
+  return { remaining, missing, found };
 }
 
 function jsonGraphFromEncodedEntry(
@@ -431,6 +486,30 @@ function jsonGraphFromEncodedEntry(
     (acc, cur) => ({ [String(cur)]: acc }),
     value
   );
+}
+
+function traverseJsonGraphOnce(
+  root: JsonGraph,
+  path: Path
+): ?{ path: Path, value: JsonGraphLeaf } {
+  let branch = root;
+  let index = 0;
+  while (index < path.length) {
+    const key = path[index];
+    const value = branch[String(key)];
+    if (value === undefined) {
+      return null;
+    }
+    if (isBranch(value)) {
+      branch = value;
+      continue;
+    }
+    return {
+      path: index === path.length - 1 ? path : path.slice(0, index),
+      value
+    };
+  }
+  throw new Error(`branch path requested: ${JSON.stringify(path)}`);
 }
 
 class CacheDataSource implements IDataSource {
@@ -459,12 +538,7 @@ class CacheDataSource implements IDataSource {
       );
       cursor.close();
       txn.abort();
-      // $FlowFixMe: Why is value mixed here?
-      const jsonGraph = Object.entries(found)
-        .map(([encoded, value]) =>
-          jsonGraphFromEncodedEntry(encoded, (value: any))
-        )
-        .reduce((acc, cur) => mergeJsonGraph(acc, (cur: any)), {});
+      const jsonGraph = found;
       let envelope = { jsonGraph };
       if (missing === null || !this.source) {
         observer.onNext(envelope);
