@@ -12,14 +12,24 @@ import type {
   PathValue,
   IDataSource
 } from "falcor-json-graph";
+import type { PathTree, LengthTree } from "falcor-path-utils";
 export type EncodedKey = string;
 export type EncodedPath = Buffer;
 export type EncodedLeaf = Buffer;
 export type EncodedPathTreeEntry = [EncodedKey, EncodedPathTree | null];
 export type EncodedPathTree = EncodedPathTreeEntry[];
 
+export type JsonGraphEnvelopeWithMissingPaths = {
+  jsonGraph: JsonGraph,
+  paths?: PathSet[],
+  missingPaths?: PathSet[],
+  invalidated?: PathSet[],
+  context?: JsonGraph
+};
+
 const { Observable, tap } = require("falcor-observable");
-const { mergeJsonGraphEnvelope, mergeJsonGraph } = require("falcor-json-graph");
+const { mergeJsonGraph } = require("falcor-json-graph");
+const { toPaths } = require("falcor-path-utils");
 const { iterKeySet, iterJsonGraph } = require("./iter");
 const lmdb = require("node-lmdb");
 
@@ -147,6 +157,61 @@ function mergeEncodedPathTree(
     }
   }
   return merged;
+}
+
+function encodedPathTreeToPathSets(
+  encodedPathTree: EncodedPathTree
+): PathSet[] {
+  return toPaths(encodedPathTreeToLengthTree(encodedPathTree));
+}
+
+function encodedPathTreeToLengthTree(
+  encodedPathTree: EncodedPathTree
+): LengthTree {
+  const lengthTree = {};
+  _encodedPathTreeToLengthTree(lengthTree, encodedPathTree, []);
+  return lengthTree;
+}
+
+function _lengthTreeParentNode(
+  lengthTree: LengthTree,
+  prefix: string[]
+): PathTree {
+  const length = prefix.length + 1;
+  let node = lengthTree[length];
+  if (node === undefined) {
+    node = lengthTree[length] = {};
+  }
+  for (const key of prefix) {
+    let child = node[key];
+    if (node === null) {
+      throw new Error("Should be unreachable");
+    }
+    if (child === undefined) {
+      child = node[key] = {};
+    }
+    node = child;
+  }
+  return node;
+}
+
+function _encodedPathTreeToLengthTree(
+  lengthTree: LengthTree,
+  encodedPathTree: EncodedPathTree,
+  prefix: string[]
+): void {
+  let lengthTreeNode;
+  for (const [encodedKey, child] of encodedPathTree) {
+    const key = String(decodeKey(encodedKey));
+    if (child === null) {
+      if (lengthTreeNode === undefined) {
+        lengthTreeNode = _lengthTreeParentNode(lengthTree, prefix);
+      }
+      lengthTreeNode[key] = null;
+    } else {
+      _encodedPathTreeToLengthTree(lengthTree, child, [...prefix, key]);
+    }
+  }
 }
 
 // tree, index, parent
@@ -370,43 +435,45 @@ function isBranch(node: JsonGraphNode): boolean %checks {
 }
 
 function walkCache(
-  pathSets: PathSet[],
-  getClosestEntry: (encodedPath: EncodedPath) => ?[EncodedPath, EncodedLeaf]
-): {
-  found: JsonGraph,
-  missing: EncodedPathTree | null
-} {
-  const encodedPathTree = encodePathTree(pathSets);
-  let found = {};
+  encodedPathTree: EncodedPathTree,
+  reader: StorageReader,
+  initialJsonGraph: JsonGraph
+): JsonGraphEnvelopeWithMissingPaths {
+  let jsonGraph = initialJsonGraph;
   let missing = null;
   let remaining = encodedPathTree;
   while (remaining !== null) {
-    ({ remaining, missing, found } = _walkCache(
+    ({ remaining, missing, jsonGraph } = _walkCache(
       remaining,
-      found,
+      jsonGraph,
       missing,
-      getClosestEntry
+      reader
     ));
   }
-  return { found, missing };
+  if (missing) {
+    const missingPaths = encodedPathTreeToPathSets(missing);
+    return { jsonGraph, missingPaths };
+  }
+  // XXX could probably set paths here too.
+  return { jsonGraph };
 }
 
 function _walkCache(
   encodedPathTree: EncodedPathTree,
-  foundIn: JsonGraph,
+  initialJsonGraph: JsonGraph,
   missingIn: EncodedPathTree | null,
-  getClosestEntry: (encodedPath: EncodedPath) => ?[EncodedPath, EncodedLeaf]
+  reader: StorageReader
 ): {
+  jsonGraph: JsonGraph,
   remaining: EncodedPathTree | null,
-  missing: EncodedPathTree | null,
-  found: JsonGraph
+  missing: EncodedPathTree | null
 } {
-  let found = foundIn;
+  let jsonGraph = initialJsonGraph;
   let remaining = null;
   let missing = missingIn;
   const rootCursor = treeCursor(encodedPathTree);
   if (rootCursor === null) {
-    return { remaining, missing, found };
+    return { jsonGraph, remaining, missing };
   }
   let cursor = rootCursor;
   while (cursor !== null) {
@@ -414,7 +481,7 @@ function _walkCache(
 
     // First look in our already found jsonGraph
     const cursorPath = decodeKeys(encodedKeys);
-    const foundPV = traverseJsonGraphOnce(found, cursorPath);
+    const foundPV = traverseJsonGraphOnce(jsonGraph, cursorPath);
     if (foundPV) {
       const { path, value } = foundPV;
 
@@ -444,7 +511,7 @@ function _walkCache(
     }
 
     const encodedPath = joinEncodedKeys(encodedKeys);
-    const foundEntry = getClosestEntry(encodedPath);
+    const foundEntry = reader.getClosestEntry(encodedPath);
     if (!foundEntry) {
       const next = null;
       const ancestor = rootCursor;
@@ -457,8 +524,8 @@ function _walkCache(
     const value = decodeLeaf(foundValue);
 
     if (foundPath.compare(encodedPath) === 0) {
-      found = mergeJsonGraph(
-        found,
+      jsonGraph = mergeJsonGraph(
+        jsonGraph,
         (jsonGraphFromEncodedEntry(foundPath, value): any)
       );
       cursor = nextTreeCursor(cursor);
@@ -475,8 +542,8 @@ function _walkCache(
     // short-circuit
     // equivalent to encodedPath.startsWith(foundPath)
     if (!remainingPath) {
-      found = mergeJsonGraph(
-        found,
+      jsonGraph = mergeJsonGraph(
+        jsonGraph,
         (jsonGraphFromEncodedEntry(foundPath, value): any)
       );
 
@@ -499,7 +566,7 @@ function _walkCache(
     cursor = next;
     continue;
   }
-  return { remaining, missing, found };
+  return { jsonGraph, remaining, missing };
 }
 
 function jsonGraphFromEncodedEntry(
@@ -536,87 +603,180 @@ function traverseJsonGraphOnce(
   throw new Error(`branch path requested: ${JSON.stringify(path)}`);
 }
 
-class CacheDataSource implements IDataSource {
-  source: ?IDataSource;
+class LmdbStorage implements IStorage {
   env: any;
   dbi: any;
 
-  constructor(
-    source: ?IDataSource,
-    envOptions: {} = {},
-    dbiOptions: {} = {}
-  ): void {
-    this.source = source;
+  constructor(envOptions: {} = {}, dbiOptions: {} = {}): void {
     this.env = new lmdb.Env();
     this.env.open(envOptions);
     this.dbi = this.env.openDbi({ ...dbiOptions, keyIsBuffer: true });
   }
 
+  getReader(): StorageReader {
+    const txn = this.env.beginTxn({ readOnly: true });
+    const cursor = new lmdb.Cursor(txn, this.dbi);
+    return {
+      txn,
+      cursor,
+      getClosestEntry(encodedPath) {
+        let k = this.cursor.goToRange(encodedPath);
+        if (k !== null && k.compare(encodedPath) !== 0) {
+          k = this.cursor.goToPrev();
+        }
+        if (k === null) {
+          return null;
+        }
+        const v = this.cursor.getCurrentBinary();
+        return [k, v];
+      },
+      close() {
+        this.cursor.close();
+        this.txn.abort();
+      }
+    };
+  }
+
+  getWriter(): StorageWriter {
+    const txn = this.env.beginTxn();
+    const dbi = this.dbi;
+    return {
+      dbi,
+      txn,
+      set(encodedPath, encodedValue) {
+        this.txn.putBinary(this.dbi, encodedPath, encodedValue);
+      },
+      commit() {
+        this.txn.commit();
+      },
+      abort() {
+        this.txn.abort();
+      }
+    };
+  }
+
+  *keys(): Iterable<EncodedPath> {
+    const txn = this.env.beginTxn({ readOnly: true });
+    const cursor = new lmdb.Cursor(txn, this.dbi);
+    let found = cursor.goToFirst();
+    while (found !== null) {
+      yield found;
+      found = cursor.goToNext();
+    }
+    cursor.close();
+    txn.abort();
+  }
+
+  *entries(): Iterable<[EncodedPath, EncodedLeaf]> {
+    const txn = this.env.beginTxn({ readOnly: true });
+    const cursor = new lmdb.Cursor(txn, this.dbi);
+    let k = cursor.goToFirst();
+    while (k !== null) {
+      const v = cursor.getCurrentBinary();
+      yield [k, v];
+      k = cursor.goToNext();
+    }
+    cursor.close();
+    txn.abort();
+  }
+
+  close() {
+    this.dbi.close();
+    this.env.close();
+  }
+}
+
+interface IStorage {
+  getReader(): StorageReader;
+  getWriter(): StorageWriter;
+  close(): void;
+}
+
+type StorageReader = {
+  getClosestEntry(encodedPath: EncodedPath): ?[EncodedPath, EncodedLeaf],
+  close(): void
+};
+
+type StorageWriter = {
+  set(encodedPath: EncodedPath, encodedLeaf: EncodedLeaf): void,
+  commit(): void,
+  abort(): void
+};
+
+class CacheDataSource implements IDataSource {
+  source: ?IDataSource;
+  storage: IStorage;
+
+  constructor(storage: IStorage, source: ?IDataSource): void {
+    this.storage = storage;
+    this.source = source;
+  }
+
   get(pathSets: PathSet[]): Observable<JsonGraphEnvelope> {
     return Observable.create(observer => {
-      const txn = this.env.beginTxn({ readOnly: true });
-      const cursor = new lmdb.Cursor(txn, this.dbi);
-      const { found, missing } = walkCache(
-        pathSets,
-        this._getClosestEntry.bind(this, cursor)
-      );
-      cursor.close();
-      txn.abort();
-      const jsonGraph = found;
-      let envelope = { jsonGraph };
-      if (missing === null || !this.source) {
+      const encodedPathTree = encodePathTree(pathSets);
+      if (encodedPathTree === null) {
+        const envelope = { jsonGraph: {}, paths: [] };
         observer.onNext(envelope);
         observer.onCompleted();
         return;
       }
-      this.source.get((missing: any)).subscribe(
+      const envelope = this._getCache(encodedPathTree);
+      if (!envelope.missingPaths || !this.source) {
+        observer.onNext(envelope);
+        observer.onCompleted();
+        return;
+      }
+      Observable.from(this.source.get(envelope.missingPaths)).subscribe(
         remoteResult => {
+          // Ideally we'd pass the result from _setCache into the initial
+          // jsonGraph for _getCache but, but different transaction...
           this._setCache(remoteResult);
-          envelope = mergeJsonGraphEnvelope(envelope, remoteResult);
+          const afterWritten = this._getCache(encodedPathTree);
+          // should have logic here to get any values that have since expired.
+          observer.onNext(afterWritten);
         },
         err => observer.onError(err),
-        () => {
-          observer.onNext(envelope);
-          observer.onCompleted();
-        }
+        () => observer.onCompleted()
       );
     });
   }
 
+  _getCache(
+    encodedPathTree: EncodedPathTree
+  ): JsonGraphEnvelopeWithMissingPaths {
+    const reader = this.storage.getReader();
+    const envelope = walkCache(encodedPathTree, reader, {});
+    reader.close();
+    return envelope;
+  }
+
   set(jsonGraphEnvelope: JsonGraphEnvelope): Observable<JsonGraphEnvelope> {
-    if (!this.source) {
-      throw new Error("must have a source for set");
-    }
-    return Observable.from(this.source.set(jsonGraphEnvelope)).pipe(
-      tap(remoteValue => {
-        this._setCache(remoteValue);
-      })
-    );
+    return Observable.create(observer => {
+      const written = this._setCache(jsonGraphEnvelope);
+      if (!this.source) {
+        observer.onNext(written);
+        observer.onCompleted();
+        return;
+      }
+      Observable.from(this.source.set(written)).subscribe(
+        remoteResult => observer.onNext(this._setCache(remoteResult)),
+        err => observer.onError(err),
+        () => observer.onCompleted()
+      );
+    });
   }
 
-  _getClosestEntry(
-    cursor: any,
-    encodedPath: EncodedPath
-  ): ?[EncodedPath, EncodedLeaf] {
-    let k = cursor.goToRange(encodedPath);
-    if (k !== null && k.compare(encodedPath) !== 0) {
-      k = cursor.goToPrev();
-    }
-    if (k === null) {
-      return null;
-    }
-    const v = cursor.getCurrentBinary();
-    return [k, v];
-  }
-
-  _setCache({ jsonGraph }: JsonGraphEnvelope): void {
-    const txn = this.env.beginTxn();
-    for (const { path, value } of iterJsonGraph(jsonGraph)) {
+  _setCache(envelope: JsonGraphEnvelope): JsonGraphEnvelope {
+    // Ideally this should respect $timestamp metadata and return newer
+    const writer = this.storage.getWriter();
+    for (const { path, value } of iterJsonGraph(envelope.jsonGraph)) {
       const encodedPath = encodePath(path);
       const encodedValue = encodeLeaf(value);
-      txn.putBinary(this.dbi, encodedPath, encodedValue);
+      writer.set(encodedPath, encodedValue);
     }
-    txn.commit();
+    writer.commit();
+    return envelope;
   }
 
   call(
@@ -636,23 +796,6 @@ class CacheDataSource implements IDataSource {
       })
     );
   }
-
-  *keys(): Iterable<EncodedPath> {
-    const txn = this.env.beginTxn({ readOnly: true });
-    const cursor = new lmdb.Cursor(txn, this.dbi);
-    let found = cursor.goToFirst();
-    while (found !== null) {
-      yield found;
-      found = cursor.goToNext();
-    }
-    cursor.close();
-    txn.commit();
-  }
-
-  close() {
-    this.dbi.close();
-    this.env.close();
-  }
 }
 
-module.exports = { CacheDataSource };
+module.exports = { CacheDataSource, LmdbStorage };

@@ -1,7 +1,7 @@
 // @flow
 "use strict";
 const { expect } = require("chai");
-const { CacheDataSource } = require("../src/cache");
+const { CacheDataSource, LmdbStorage } = require("../src/cache");
 const tmp = require("tmp");
 
 function range(start: number, stop?: number): number[] {
@@ -32,7 +32,8 @@ function makeLolomo(rows: number = 1, cols: number = 1, id: string = "ABC") {
     .map(x => ({ title: `title ${Math.trunc(x / cols)} ${x % cols}` }))
     .reduce((acc, v, x) => ({ ...acc, [x]: v }), {});
   const jsonGraph = { lolomo, lolomos, lists, videos };
-  return { jsonGraph };
+  const paths = [["lolomo", { length: ROWS }, { length: COLS }, "title"]];
+  return { jsonGraph, paths };
 }
 
 const ROWS = 2;
@@ -41,34 +42,34 @@ const basicLolomo = makeLolomo(ROWS, COLS);
 
 describe("CacheDataSource", function() {
   let tmpdir;
+  let storage;
+  let ds;
 
   beforeEach(function() {
     tmpdir = tmp.dirSync({ unsafeCleanup: true });
+    storage = new LmdbStorage(
+      { path: tmpdir.name },
+      { name: "mydb", create: true }
+    );
+    ds = new CacheDataSource(storage);
   });
 
   afterEach(function() {
     tmpdir.removeCallback();
+    storage.close();
   });
 
-  it("sets data", function() {
-    const ds = new CacheDataSource(
-      null,
-      { path: tmpdir.name },
-      { name: "mydb", create: true }
-    );
-    ds._setCache(basicLolomo);
-    const keys = Array.from(ds.keys());
-    expect(keys.length).to.equal(1 + ROWS + ROWS * COLS + ROWS * COLS);
+  it("sets data", function(done) {
+    ds.set(basicLolomo).subscribe(null, done, () => {
+      const keys = Array.from(storage.keys());
+      expect(keys.length).to.equal(1 + ROWS + ROWS * COLS + ROWS * COLS);
+      done();
+    });
   });
 
   it("gets data", function(done) {
-    const ds = new CacheDataSource(
-      null,
-      { path: tmpdir.name },
-      { name: "mydb", create: true }
-    );
-    ds._setCache(basicLolomo);
-    ds.get([["lolomo", { length: ROWS }, { length: COLS }, "title"]]).subscribe(
+    ds.set(basicLolomo).subscribe();
+    ds.get(basicLolomo.paths).subscribe(
       result => {
         expect(result.jsonGraph).to.deep.equal(basicLolomo.jsonGraph);
       },
