@@ -1,7 +1,7 @@
 // @flow
 "use strict";
 const { expect } = require("chai");
-const { CacheDataSource, LmdbStorage } = require("../src/cache");
+const { CacheDataSource, LmdbStorage } = require("../src");
 const tmp = require("tmp");
 
 function range(start: number, stop?: number): number[] {
