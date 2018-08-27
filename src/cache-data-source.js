@@ -13,7 +13,7 @@ import type { JsonGraphEnvelopeWithMissingPaths } from "./util";
 import type { SortedPathTree } from "./sorted-path-tree";
 import type { IStorage, IStorageReader } from "./storage";
 
-const { Observable, map } = require("falcor-observable");
+const { Observable, map, mergeMap } = require("falcor-observable");
 const { mergeJsonGraph } = require("falcor-json-graph");
 const { iterJsonGraph } = require("./iter");
 const {
@@ -42,10 +42,13 @@ const {
 } = require("./encoding");
 
 function walkCache(
-  sortedPathTree: SortedPathTree,
+  sortedPathTree: ?SortedPathTree,
   reader: IStorageReader,
-  initialJsonGraph: JsonGraph
+  initialJsonGraph: JsonGraph = {}
 ): JsonGraphEnvelopeWithMissingPaths {
+  if (!sortedPathTree) {
+    return { jsonGraph: {}, paths: [] };
+  }
   let jsonGraph = initialJsonGraph;
   let missing = null;
   let remaining = sortedPathTree;
@@ -186,68 +189,60 @@ class CacheDataSource implements IDataSource {
     this.source = source;
   }
 
-  get(pathSets: PathSet[]): Observable<JsonGraphEnvelope> {
-    return Observable.create(observer => {
-      const sortedPathTree = sortedPathTreeFromPathSets(pathSets);
-      const envelope = this._getCache(sortedPathTree);
-      if (!envelope.missingPaths || !this.source) {
-        observer.onNext(envelope);
-        observer.onCompleted();
-        return;
-      }
-      Observable.from(this.source.get(envelope.missingPaths)).subscribe(
-        remoteResult => {
-          // Ideally we'd pass the result from _setCache into the initial
-          // jsonGraph for _getCache but, but different transaction...
-          this._setCache(remoteResult);
-          const afterWritten = this._getCache(sortedPathTree);
-          // should have logic here to get any values that have since expired.
-          observer.onNext(afterWritten);
-        },
-        err => observer.onError(err),
-        () => observer.onCompleted()
-      );
-    });
+  get(pathSets: PathSet[]): Observable<JsonGraphEnvelopeWithMissingPaths> {
+    const sortedPathTree = sortedPathTreeFromPathSets(pathSets);
+    return Observable.from(this.storage.getReader()).pipe(
+      map(reader => walkCache(sortedPathTree, reader)),
+      mergeMap(envelope => {
+        if (!envelope.missingPaths || !this.source) {
+          return Observable.of(envelope);
+        }
+        return Observable.from(this.source.get(envelope.missingPaths)).pipe(
+          mergeMap(remoteResult =>
+            // should have logic here to get any values that have since expired.
+            this._setAndGetCache(remoteResult, sortedPathTree)
+          )
+        );
+      })
+    );
   }
 
-  _getCache(
+  set(
+    jsonGraphEnvelope: JsonGraphEnvelope
+  ): Observable<JsonGraphEnvelopeWithMissingPaths> {
+    const { jsonGraph, paths } = jsonGraphEnvelope;
+    const sortedPathTree = paths ? sortedPathTreeFromPathSets(paths) : null;
+    const obs = this._setAndGetCache(jsonGraph, sortedPathTree);
+    const { source } = this;
+    if (!source) {
+      return obs;
+    }
+    return obs.pipe(
+      mergeMap(written =>
+        Observable.from(source.set(written)).pipe(
+          mergeMap(remoteResult =>
+            this._setAndGetCache(remoteResult.jsonGraph, sortedPathTree)
+          )
+        )
+      )
+    );
+  }
+
+  _setAndGetCache(
+    jsonGraph: JsonGraph,
     sortedPathTree: ?SortedPathTree
-  ): JsonGraphEnvelopeWithMissingPaths {
-    if (!sortedPathTree) {
-      return { jsonGraph: {}, paths: [] };
-    }
-    const reader = this.storage.getReader();
-    const envelope = walkCache(sortedPathTree, reader, {});
-    reader.close();
-    return envelope;
-  }
-
-  set(jsonGraphEnvelope: JsonGraphEnvelope): Observable<JsonGraphEnvelope> {
-    return Observable.create(observer => {
-      const written = this._setCache(jsonGraphEnvelope);
-      if (!this.source) {
-        observer.onNext(written);
-        observer.onCompleted();
-        return;
-      }
-      Observable.from(this.source.set(written)).subscribe(
-        remoteResult => observer.onNext(this._setCache(remoteResult)),
-        err => observer.onError(err),
-        () => observer.onCompleted()
-      );
-    });
-  }
-
-  _setCache(envelope: JsonGraphEnvelope): JsonGraphEnvelope {
-    // Ideally this should respect $timestamp metadata and return newer
-    const writer = this.storage.getWriter();
-    for (const { path, value } of iterJsonGraph(envelope.jsonGraph)) {
-      const encodedPath = encodePath(path);
-      const encodedValue = encodeValue(value);
-      writer.set(encodedPath, encodedValue);
-    }
-    writer.commit();
-    return envelope;
+  ): Observable<JsonGraphEnvelopeWithMissingPaths> {
+    return Observable.from(this.storage.getReaderWriter()).pipe(
+      map(rw => {
+        // Ideally this should respect $timestamp metadata and return newer
+        for (const { path, value } of iterJsonGraph(jsonGraph)) {
+          const encodedPath = encodePath(path);
+          const encodedValue = encodeValue(value);
+          rw.setPathValue(encodedPath, encodedValue);
+        }
+        return walkCache(sortedPathTree, rw, jsonGraph);
+      })
+    );
   }
 
   call(
@@ -255,13 +250,20 @@ class CacheDataSource implements IDataSource {
     args?: JsonGraphNode[] = [],
     refPaths?: PathSet[] = [],
     thisPaths?: PathSet[] = []
-  ): Observable<JsonGraphEnvelope> {
-    if (!this.source) {
+  ): Observable<JsonGraphEnvelopeWithMissingPaths> {
+    const { source } = this;
+    if (!source) {
       throw new Error("must have a source for call");
     }
     return Observable.from(
-      this.source.call(callPath, args, refPaths, thisPaths)
-    ).pipe(map(remoteValue => this._setCache(remoteValue)));
+      source.call(callPath, args, refPaths, thisPaths)
+    ).pipe(
+      mergeMap(remoteValue => {
+        const { paths } = remoteValue;
+        const sortedPathTree = paths ? sortedPathTreeFromPathSets(paths) : null;
+        return this._setAndGetCache(remoteValue, sortedPathTree);
+      })
+    );
   }
 }
 

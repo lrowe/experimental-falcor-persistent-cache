@@ -1,20 +1,20 @@
 // @flow
 "use strict";
 import type { EncodedPath, EncodedValue } from "./encoding";
+import type { IObservable } from "falcor-observable";
 
 export interface IStorage {
-  getReader(): IStorageReader;
-  getWriter(): IStorageWriter;
+  getReader(): IObservable<IStorageReader>;
+  getReaderWriter(): IObservable<IStorageReaderWriter>;
   close(): void;
 }
 
 export interface IStorageReader {
   getLessThanEqual(encodedPath: EncodedPath): ?[EncodedPath, EncodedValue];
-  close(): void;
 }
 
 export interface IStorageWriter {
-  set(encodedPath: EncodedPath, encodedValue: EncodedValue): void;
-  commit(): void;
-  abort(): void;
+  setPathValue(encodedPath: EncodedPath, encodedValue: EncodedValue): void;
 }
+
+export interface IStorageReaderWriter extends IStorageReader, IStorageWriter {}

@@ -2,16 +2,17 @@
 "use strict";
 
 import type { EncodedPath, EncodedValue } from "./encoding";
-import type { IStorage, IStorageReader, IStorageWriter } from "./storage";
+import type { IStorage, IStorageReader, IStorageReaderWriter } from "./storage";
 
+const { Observable } = require("falcor-observable");
 const Database = require("better-sqlite3");
 
 class Connection {
   db: Database;
   checkedOutTo: ?{};
-  _begin: any;
-  _rollback: any;
-  _commit: any;
+  begin: any;
+  rollback: any;
+  commit: any;
   set: any;
   getLessThanEqual: any;
   keys: any;
@@ -20,9 +21,9 @@ class Connection {
   constructor(db: Database): void {
     this.db = db;
     this.checkedOutTo = null;
-    this._begin = db.prepare("BEGIN");
-    this._rollback = db.prepare("ROLLBACK");
-    this._commit = db.prepare("COMMIT");
+    this.begin = db.prepare("BEGIN");
+    this.rollback = db.prepare("ROLLBACK");
+    this.commit = db.prepare("COMMIT");
     this.set = db.prepare("INSERT INTO kv (k, v) VALUES (?, ?)");
     this.getLessThanEqual = db.prepare(
       "SELECT k, v from kv WHERE k <= ? ORDER BY k DESC LIMIT 1"
@@ -30,109 +31,27 @@ class Connection {
     this.keys = db.prepare("SELECT k from kv ORDER BY k");
     this.entries = db.prepare("SELECT k, v from kv ORDER BY k");
   }
-
-  checkOut(checkedOutTo: {}): this {
-    if (this.checkedOutTo) {
-      throw new Error("connection already checked out.");
-    }
-    this.checkedOutTo = checkedOutTo;
-    return this;
-  }
-
-  checkIn(checkedOutTo: {}): null {
-    if (this.checkedOutTo !== checkedOutTo) {
-      throw new Error("connection checked out to someone else.");
-    }
-    this.checkedOutTo = null;
-    if (this.db.inTransaction) {
-      this._rollback.run();
-    }
-    return null;
-  }
-
-  begin(): void {
-    this._begin.run();
-  }
-
-  commit(): void {
-    if (this.db.inTransaction) {
-      this._commit.run();
-    }
-  }
-
-  rollback(): void {
-    if (this.db.inTransaction) {
-      this._rollback.run();
-    }
-  }
-
-  close(): void {
-    this.db.close();
-  }
 }
 
 class SqliteStorageReader implements IStorageReader {
-  connection: ?Connection;
-
+  connection: Connection;
   constructor(connection: Connection): void {
-    this.connection = connection.checkOut(this);
-    connection.begin();
+    this.connection = connection;
   }
-
-  getLessThanEqual(encodedPath: EncodedPath): ?[EncodedPath, EncodedValue] {
-    const { connection } = this;
-    if (!connection) {
-      throw new Error("closed");
-    }
-    const row = connection.getLessThanEqual.get(encodedPath);
+  getLessThanEqual(encodedPath: EncodedPath) {
+    const row = this.connection.getLessThanEqual.get(encodedPath);
     if (!row) {
       return null;
     }
     const { k, v } = row;
     return [k, v];
   }
-
-  close(): void {
-    const { connection } = this;
-    if (!connection) {
-      throw new Error("closed");
-    }
-    this.connection = connection.checkIn(this);
-  }
 }
 
-class SqliteStorageWriter implements IStorageWriter {
-  connection: ?Connection;
-
-  constructor(connection: Connection): void {
-    this.connection = connection.checkOut(this);
-    connection.begin();
-  }
-
-  set(encodedPath: EncodedPath, encodedValue: EncodedValue): void {
-    const { connection } = this;
-    if (!connection) {
-      throw new Error("closed");
-    }
-    connection.set.run(encodedPath, encodedValue);
-  }
-
-  commit(): void {
-    const { connection } = this;
-    if (!connection) {
-      throw new Error("closed");
-    }
-    connection.commit();
-    this.connection = connection.checkIn(this);
-  }
-
-  abort(): void {
-    const { connection } = this;
-    if (!connection) {
-      throw new Error("closed");
-    }
-    connection.rollback();
-    this.connection = connection.checkIn(this);
+class SqliteStorageReaderWriter extends SqliteStorageReader
+  implements IStorageReaderWriter {
+  setPathValue(encodedPath: EncodedPath, encodedValue: EncodedValue): void {
+    this.connection.set.run(encodedPath, encodedValue);
   }
 }
 
@@ -152,35 +71,47 @@ class SqliteStorage implements IStorage {
     );
   }
 
-  getReader(): SqliteStorageReader {
-    return new SqliteStorageReader(this.readConnection);
+  getReader(): Observable<IStorageReader> {
+    return Observable.create(observer => {
+      const connection = this.readConnection;
+      connection.begin.run();
+      observer.onNext(new SqliteStorageReader(connection));
+      connection.rollback.run();
+      observer.onCompleted();
+    });
   }
 
-  getWriter(): SqliteStorageWriter {
-    return new SqliteStorageWriter(this.writeConnection);
+  getReaderWriter(): Observable<IStorageReaderWriter> {
+    return Observable.create(observer => {
+      const connection = this.writeConnection;
+      connection.begin.run();
+      observer.onNext(new SqliteStorageReaderWriter(connection));
+      connection.commit.run();
+      observer.onCompleted();
+    });
   }
 
   *keys(): Iterable<EncodedPath> {
-    const connection = this.readConnection.checkOut(this);
-    connection.begin();
+    const connection = this.readConnection;
+    connection.begin.run();
     for (const { k } of connection.keys.iterate()) {
       yield k;
     }
-    connection.checkIn(this);
+    connection.rollback.run();
   }
 
   *entries(): Iterable<[EncodedPath, EncodedValue]> {
-    const connection = this.readConnection.checkOut(this);
-    connection.begin();
+    const connection = this.readConnection;
+    connection.begin.run();
     for (const { k, v } of connection.entries.iterate()) {
       yield [k, v];
     }
-    connection.checkIn(this);
+    connection.rollback.run();
   }
 
   close() {
-    this.readConnection.close();
-    this.writeConnection.close();
+    this.readConnection.db.close();
+    this.writeConnection.db.close();
   }
 }
 
