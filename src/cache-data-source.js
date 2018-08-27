@@ -126,9 +126,9 @@ function walkCacheOnce(
     }
     const [foundEncodedPath, foundEncodedValue] = foundEntry;
     const foundPath = decodePath(foundEncodedPath);
-    const value = decodeValue(foundEncodedValue);
 
     if (foundEncodedPath.compare(encodedPath) === 0) {
+      const value = decodeValue(foundEncodedValue);
       jsonGraph = mergeJsonGraph(
         jsonGraph,
         jsonGraphFromPathValue(foundPath, value)
@@ -146,6 +146,7 @@ function walkCacheOnce(
     // short-circuit
     // equivalent to encodedPath.startsWith(foundPath)
     if (!relativePath) {
+      const value = decodeValue(foundEncodedValue);
       jsonGraph = mergeJsonGraph(
         jsonGraph,
         jsonGraphFromPathValue(foundPath, value)
