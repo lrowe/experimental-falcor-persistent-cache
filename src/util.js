@@ -41,6 +41,7 @@ function traverseJsonGraphOnce(
   let index = 0;
   while (index < path.length) {
     const key = path[index];
+    ++index;
     const value = branch[String(key)];
     if (value === undefined) {
       return null;
@@ -50,7 +51,7 @@ function traverseJsonGraphOnce(
       continue;
     }
     return {
-      path: index === path.length - 1 ? path : path.slice(0, index),
+      path: index === path.length ? path : path.slice(0, index),
       value
     };
   }
