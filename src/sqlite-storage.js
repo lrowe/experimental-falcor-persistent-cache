@@ -6,28 +6,85 @@ import type { IStorage, IStorageReader, IStorageWriter } from "./storage";
 
 const Database = require("better-sqlite3");
 
-class ReadConnection implements IStorageReader {
-  db: any;
+class Connection {
+  db: Database;
+  checkedOutTo: ?{};
   _begin: any;
   _rollback: any;
-  _getLessThanEqual: any;
-  _keys: any;
-  _entries: any;
+  _commit: any;
+  set: any;
+  getLessThanEqual: any;
+  keys: any;
+  entries: any;
 
-  constructor(filename: string, options: {}): void {
-    this.db = new Database(filename, { ...options, readonly: true });
-    this._begin = this.db.prepare("BEGIN");
-    this._rollback = this.db.prepare("ROLLBACK");
-    this._getLessThanEqual = this.db.prepare(
+  constructor(db: Database): void {
+    this.db = db;
+    this.checkedOutTo = null;
+    this._begin = db.prepare("BEGIN");
+    this._rollback = db.prepare("ROLLBACK");
+    this._commit = db.prepare("COMMIT");
+    this.set = db.prepare("INSERT INTO kv (k, v) VALUES (?, ?)");
+    this.getLessThanEqual = db.prepare(
       "SELECT k, v from kv WHERE k <= ? ORDER BY k DESC LIMIT 1"
     );
-    this._keys = this.db.prepare("SELECT k from kv ORDER BY k");
-    this._entries = this.db.prepare("SELECT k, v from kv ORDER BY k");
+    this.keys = db.prepare("SELECT k from kv ORDER BY k");
+    this.entries = db.prepare("SELECT k, v from kv ORDER BY k");
+  }
+
+  checkOut(checkedOutTo: {}): this {
+    if (this.checkedOutTo) {
+      throw new Error("connection already checked out.");
+    }
+    this.checkedOutTo = checkedOutTo;
+    return this;
+  }
+
+  checkIn(checkedOutTo: {}): null {
+    if (this.checkedOutTo !== checkedOutTo) {
+      throw new Error("connection checked out to someone else.");
+    }
+    this.checkedOutTo = null;
+    if (this.db.inTransaction) {
+      this._rollback.run();
+    }
+    return null;
+  }
+
+  begin(): void {
     this._begin.run();
   }
 
+  commit(): void {
+    if (this.db.inTransaction) {
+      this._commit.run();
+    }
+  }
+
+  rollback(): void {
+    if (this.db.inTransaction) {
+      this._rollback.run();
+    }
+  }
+
+  close(): void {
+    this.db.close();
+  }
+}
+
+class SqliteStorageReader implements IStorageReader {
+  connection: ?Connection;
+
+  constructor(connection: Connection): void {
+    this.connection = connection.checkOut(this);
+    connection.begin();
+  }
+
   getLessThanEqual(encodedPath: EncodedPath): ?[EncodedPath, EncodedValue] {
-    const row = this._getLessThanEqual.get(encodedPath);
+    const { connection } = this;
+    if (!connection) {
+      throw new Error("closed");
+    }
+    const row = connection.getLessThanEqual.get(encodedPath);
     if (!row) {
       return null;
     }
@@ -35,96 +92,96 @@ class ReadConnection implements IStorageReader {
     return [k, v];
   }
 
-  *keys(): Iterable<EncodedPath> {
-    for (const { k } of this._keys.iterate()) {
-      yield k;
-    }
-  }
-
-  *entries(): Iterable<[EncodedPath, EncodedValue]> {
-    for (const { k, v } of this._entries.iterate()) {
-      yield [k, v];
-    }
-  }
-
   close(): void {
-    if (this.db.inTransaction) {
-      this._rollback.run();
+    const { connection } = this;
+    if (!connection) {
+      throw new Error("closed");
     }
-    this.db.close();
+    this.connection = connection.checkIn(this);
   }
 }
 
-class WriteConnection implements IStorageWriter {
-  db: any;
-  _begin: any;
-  _rollback: any;
-  _commit: any;
-  _set: any;
+class SqliteStorageWriter implements IStorageWriter {
+  connection: ?Connection;
 
-  constructor(filename: string, options: {}): void {
-    this.db = new Database(filename, options);
-    this._begin = this.db.prepare("BEGIN");
-    this._rollback = this.db.prepare("ROLLBACK");
-    this._commit = this.db.prepare("COMMIT");
-    this._set = this.db.prepare("INSERT INTO kv (k, v) VALUES (?, ?)");
-    this._begin.run();
+  constructor(connection: Connection): void {
+    this.connection = connection.checkOut(this);
+    connection.begin();
   }
 
-  set(encodedPath, encodedValue) {
-    this._set.run(encodedPath, encodedValue);
-  }
-
-  commit() {
-    if (this.db.inTransaction) {
-      this._commit.run();
+  set(encodedPath: EncodedPath, encodedValue: EncodedValue): void {
+    const { connection } = this;
+    if (!connection) {
+      throw new Error("closed");
     }
-    this.db.close();
+    connection.set.run(encodedPath, encodedValue);
   }
 
-  abort() {
-    if (this.db.inTransaction) {
-      this._rollback.run();
+  commit(): void {
+    const { connection } = this;
+    if (!connection) {
+      throw new Error("closed");
     }
-    this.db.close();
+    connection.commit();
+    this.connection = connection.checkIn(this);
+  }
+
+  abort(): void {
+    const { connection } = this;
+    if (!connection) {
+      throw new Error("closed");
+    }
+    connection.rollback();
+    this.connection = connection.checkIn(this);
   }
 }
 
 class SqliteStorage implements IStorage {
-  filename: string;
-  options: {};
+  readConnection: Connection;
+  writeConnection: Connection;
 
   constructor(filename: string, options?: {} = {}): void {
-    this.filename = filename;
-    this.options = options;
     const db = new Database(filename, options);
     db.exec(
       "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID"
     );
-    db.close();
+    // As all reader / writer usage is sync so we only need one of each.
+    this.writeConnection = new Connection(db);
+    this.readConnection = new Connection(
+      new Database(filename, { ...options, readonly: true })
+    );
   }
 
-  getReader(): ReadConnection {
-    return new ReadConnection(this.filename, this.options);
+  getReader(): SqliteStorageReader {
+    return new SqliteStorageReader(this.readConnection);
   }
 
-  getWriter(): WriteConnection {
-    return new WriteConnection(this.filename, this.options);
+  getWriter(): SqliteStorageWriter {
+    return new SqliteStorageWriter(this.writeConnection);
   }
 
   *keys(): Iterable<EncodedPath> {
-    const reader = this.getReader();
-    yield* reader.keys();
-    reader.close();
+    const connection = this.readConnection.checkOut(this);
+    connection.begin();
+    for (const { k } of connection.keys.iterate()) {
+      yield k;
+    }
+    connection.checkIn(this);
   }
 
   *entries(): Iterable<[EncodedPath, EncodedValue]> {
-    const reader = this.getReader();
-    yield* reader.entries();
-    reader.close();
+    const connection = this.readConnection.checkOut(this);
+    connection.begin();
+    for (const { k, v } of connection.entries.iterate()) {
+      yield [k, v];
+    }
+    connection.checkIn(this);
   }
 
-  close() {}
+  close() {
+    this.readConnection.close();
+    this.writeConnection.close();
+  }
 }
 
 module.exports = { SqliteStorage };
