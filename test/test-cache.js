@@ -1,8 +1,9 @@
 // @flow
 "use strict";
 const { expect } = require("chai");
-const { CacheDataSource, LmdbStorage } = require("../src");
+const { CacheDataSource, LmdbStorage, SqliteStorage } = require("../src");
 const tmp = require("tmp");
+const path = require("path");
 
 function range(start: number, stop?: number): number[] {
   if (stop === undefined) {
@@ -40,41 +41,53 @@ const ROWS = 2;
 const COLS = 2;
 const basicLolomo = makeLolomo(ROWS, COLS);
 
-describe("CacheDataSource", function() {
-  let tmpdir;
-  let storage;
-  let ds;
-
-  beforeEach(function() {
-    tmpdir = tmp.dirSync({ unsafeCleanup: true });
-    storage = new LmdbStorage(
+const storages = [
+  function sqlite(tmpdir) {
+    const filename = path.join(tmpdir.name, "test.sqlite");
+    return new SqliteStorage(filename, { fileMustExist: false });
+  },
+  function lmdb(tmpdir) {
+    return new LmdbStorage(
       { path: tmpdir.name },
       { name: "mydb", create: true }
     );
-    ds = new CacheDataSource(storage);
-  });
+  }
+];
 
-  afterEach(function() {
-    tmpdir.removeCallback();
-    storage.close();
-  });
+for (const makeStorage of storages) {
+  describe(`CacheDataSource - ${makeStorage.name}`, function() {
+    let tmpdir;
+    let storage;
+    let ds;
 
-  it("sets data", function(done) {
-    ds.set(basicLolomo).subscribe(null, done, () => {
-      const keys = Array.from(storage.keys());
-      expect(keys.length).to.equal(1 + ROWS + ROWS * COLS + ROWS * COLS);
-      done();
+    beforeEach(function() {
+      tmpdir = tmp.dirSync({ unsafeCleanup: true });
+      storage = makeStorage(tmpdir);
+      ds = new CacheDataSource(storage);
+    });
+
+    afterEach(function() {
+      tmpdir.removeCallback();
+      storage.close();
+    });
+
+    it("sets data", function(done) {
+      ds.set(basicLolomo).subscribe(null, done, () => {
+        const keys = Array.from(storage.keys());
+        expect(keys.length).to.equal(1 + ROWS + ROWS * COLS + ROWS * COLS);
+        done();
+      });
+    });
+
+    it("gets data", function(done) {
+      ds.set(basicLolomo).subscribe();
+      ds.get(basicLolomo.paths).subscribe(
+        result => {
+          expect(result.jsonGraph).to.deep.equal(basicLolomo.jsonGraph);
+        },
+        done,
+        done
+      );
     });
   });
-
-  it("gets data", function(done) {
-    ds.set(basicLolomo).subscribe();
-    ds.get(basicLolomo.paths).subscribe(
-      result => {
-        expect(result.jsonGraph).to.deep.equal(basicLolomo.jsonGraph);
-      },
-      done,
-      done
-    );
-  });
-});
+}
