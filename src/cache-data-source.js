@@ -11,7 +11,7 @@ import type {
 
 import type { JsonGraphEnvelopeWithMissingPaths } from "./util";
 import type { SortedPathTree } from "./sorted-path-tree";
-import type { IStorage, IStorageReader } from "./storage";
+import type { IStorage, IStorageReader, IStorageReaderWriter } from "./storage";
 
 const { Observable, map, mergeMap } = require("falcor-observable");
 const { mergeJsonGraph } = require("falcor-json-graph");
@@ -232,7 +232,10 @@ class CacheDataSource implements IDataSource {
     jsonGraph: JsonGraph,
     sortedPathTree: ?SortedPathTree
   ): Observable<JsonGraphEnvelopeWithMissingPaths> {
-    return Observable.from(this.storage.getReaderWriter()).pipe(
+    const obs: Observable<IStorageReaderWriter> = Observable.from(
+      this.storage.getReaderWriter()
+    );
+    return obs.pipe(
       map(rw => {
         // Ideally this should respect $timestamp metadata and return newer
         for (const { path, value } of iterJsonGraph(jsonGraph)) {
@@ -240,7 +243,7 @@ class CacheDataSource implements IDataSource {
           const encodedValue = encodeValue(value);
           rw.setPathValue(encodedPath, encodedValue);
         }
-        return walkCache(sortedPathTree, rw, jsonGraph);
+        return walkCache(sortedPathTree, rw.getLessThanEqual, jsonGraph);
       })
     );
   }

@@ -7,6 +7,20 @@ import type { IStorage, IStorageReader, IStorageReaderWriter } from "./storage";
 const { Observable } = require("falcor-observable");
 const lmdb = require("node-lmdb");
 
+function goToRangeLessThanEqual(cursor: any, key: Buffer): Buffer | null {
+  // Ideally this would be moved down to C.
+  // https://www.openldap.org/lists/openldap-technical/201502/msg00134.html
+  const foundKey = cursor.goToRange(key);
+  if (foundKey === null) {
+    // no keys in db higher than encodedPath, but need closest lower key.
+    return cursor.goToLast();
+  }
+  if (foundKey.compare(key) > 0) {
+    return cursor.goToPrev();
+  }
+  return foundKey;
+}
+
 class LmdbStorageReader implements IStorageReader {
   txn: any;
   dbi: any;
@@ -18,10 +32,7 @@ class LmdbStorageReader implements IStorageReader {
   }
   getLessThanEqual(encodedPath: EncodedPath) {
     const { cursor } = this;
-    let k = cursor.goToRange(encodedPath);
-    if (k !== null && k.compare(encodedPath) !== 0) {
-      k = cursor.goToPrev();
-    }
+    const k = goToRangeLessThanEqual(cursor, encodedPath);
     if (k === null) {
       return null;
     }
